@@ -1,0 +1,25 @@
+# 环境变量（含 API Key，严禁提交）
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# Jupyter Notebook 检查点
+.ipynb_checkpoints/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode/
+.idea/
