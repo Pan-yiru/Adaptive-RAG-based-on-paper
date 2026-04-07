@@ -265,33 +265,20 @@ def create_retriever(chunks: List, weights: List[float] = None, vectorstore=None
 # 4. 问题分类器
 
 class QuestionClassifier:
-    """问题类型分类器：LLM Router + 关键词混合策略"""
+    """
+    问题类型分类器：纯 LLM Router，判断是否为多跳问题。
 
-    # 复杂问题的关键词
-    COMPLEX_KEYWORDS = [
-        "为什么", "如何", "怎样", "原理", "机制", "区别", "差异",
-        "对比", "比较", "分析", "影响", "关系", "优势", "劣势",
-        "权衡", "优缺点", "适用场景"
-    ]
-
-    # 推理问题的关键词
-    REASONING_KEYWORDS = [
-        "如果", "假设", "推测", "推断", "可能", "应该", "会怎样",
-        "场景", "情况下", "变化", "导致", "结果", "性能瓶颈"
-    ]
-
-    # 事实问题的关键词（高置信度）
-    FACTUAL_KEYWORDS = [
-        "多少", "是什么", "哪些", "几个", "参数", "公式", "取值",
-        "配置", "层", "维度", "大小", "数量", "模型", "架构"
-    ]
+    多跳问题（multi-hop）：需要跨越文档中多个独立信息片段、串联推理才能得出答案。
+    - 多跳 → complex → Advanced RAG（问题分解 + Rerank + 反思重写）
+    - 单跳 → simple  → Baseline RAG（直接向量检索）
+    """
 
     def __init__(self, llm=None):
         """
         初始化分类器
 
         参数:
-        - llm: 可选的 LLM 实例（用于语义路由）
+        - llm: 可选的 LLM 实例
         """
         self.llm = llm or ChatOpenAI(
             model_name="qwen-turbo",
@@ -301,122 +288,68 @@ class QuestionClassifier:
             max_tokens=256
         )
 
-        # LLM Router prompt
+        # 多跳检测 prompt
         self.router_prompt = ChatPromptTemplate.from_template(
-            """你是一个专业的问题分类器。请分析用户问题并判断其类型。
+            """你是一个专业的问题路由器，负责判断用户问题是否为「多跳问题」。
 
-问题类型定义：
-1. simple (事实题): 可以直接从文档中找到明确答案的问题
-   - 例如：参数取值、配置细节、具体数字、是什么等
-   - 特征：答案在文档中有明确对应，不需要推理或综合
+「多跳问题」定义：
+  需要从文档的多个不同位置提取信息，并将这些信息串联推理才能得出完整答案。
+  典型特征（满足任意一条即为多跳）：
+  1. 需要理解两个或以上概念/模块之间的关系或差异
+  2. 需要先回答一个子问题，再用子答案继续推理
+  3. 需要综合对比多处描述（如「为什么 A 优于 B」、「A 和 B 有何不同」）
+  4. 包含假设推理或需要基于文档内容做额外推断
 
-2. complex (复杂题): 需要综合多个信息点或深入理解的问题
-   - 例如：为什么、如何、原理、区别、分析等
-   - 特征：需要整合文档多处信息，或需要理解概念间的关系
+「单跳问题」定义：
+  答案可以直接从文档某一处找到，无需串联多处信息。
+  典型特征：询问具体数值、名称、参数、步骤等事实性内容。
 
-3. reasoning (推理题): 需要假设、推断或超出文档明确内容的推理
-   - 例如：假设场景、推测结果、推断影响等
-   - 特征：包含假设词（如果、假设），或需要基于文档进行推理
+用户问题：{question}
 
-问题：{question}
-
-请严格按照以下 JSON 格式返回（不要输出其他内容）：
+请严格按照以下 JSON 格式返回（不要输出任何其他内容）：
 {{
-  "question_type": "simple/complex/reasoning",
+  "is_multihop": true 或 false,
   "confidence": 0.0-1.0,
-  "reasoning": "分类理由"
+  "reasoning": "判断理由（一句话）"
 }}
 """
         )
 
         self.router_chain = self.router_prompt | self.llm | StrOutputParser()
 
-    def _keyword_classify(self, question: str) -> tuple:
+    def classify(self, question: str) -> dict:
         """
-        基于关键词的快速分类
-
-        返回: (类型, 置信度)
-        """
-        # 检查推理关键词
-        reasoning_count = sum(1 for kw in self.REASONING_KEYWORDS if kw in question)
-        if reasoning_count >= 1:
-            confidence = min(0.9, 0.5 + reasoning_count * 0.1)
-            return "reasoning", confidence
-
-        # 检查复杂关键词
-        complex_count = sum(1 for kw in self.COMPLEX_KEYWORDS if kw in question)
-        if complex_count >= 1:
-            confidence = min(0.85, 0.5 + complex_count * 0.1)
-            return "complex", confidence
-
-        # 检查事实关键词（高置信度）
-        factual_count = sum(1 for kw in self.FACTUAL_KEYWORDS if kw in question)
-        if factual_count >= 1:
-            confidence = min(0.95, 0.6 + factual_count * 0.1)
-            return "simple", confidence
-
-        # 问题长度作为判断依据（低置信度）
-        if len(question) > 45:
-            return "complex", 0.4
-
-        # 默认为简单问题（低置信度）
-        return "simple", 0.3
-
-    def classify(self, question: str, use_llm_router: bool = True, confidence_threshold: float = 0.6) -> dict:
-        """
-        分类问题类型（混合策略）
-
-        参数:
-        - question: 用户问题
-        - use_llm_router: 是否使用 LLM Router（默认 True）
-        - confidence_threshold: 关键词分类的置信度阈值（低于此值时使用 LLM Router）
+        判断问题是否为多跳问题并路由。
 
         返回:
         {
-            "type": "simple/complex/reasoning",
+            "type": "complex"（多跳）或 "simple"（单跳）,
             "confidence": 0.0-1.0,
-            "method": "keyword/llm_router",
-            "reasoning": "分类理由"
+            "method": "llm_router" 或 "fallback",
+            "reasoning": "判断理由"
         }
         """
-        # 1. 先尝试快速关键词分类
-        keyword_type, keyword_confidence = self._keyword_classify(question)
-
-        # 2. 如果不使用 LLM Router 或置信度足够高，直接返回关键词分类结果
-        if not use_llm_router or keyword_confidence >= confidence_threshold:
-            return {
-                "type": keyword_type,
-                "confidence": keyword_confidence,
-                "method": "keyword",
-                "reasoning": f"关键词匹配（置信度: {keyword_confidence:.2f}）"
-            }
-
-        # 3. 置信度低时，使用 LLM Router 进行语义分类
         try:
-            print(f"  🔄 关键词分类置信度较低 ({keyword_confidence:.2f})，使用 LLM Router...")
             router_output = self.router_chain.invoke({"question": question})
-
-            # 尝试提取 JSON
             json_match = re.search(r'\{[^{}]*\}', router_output)
             if json_match:
-                router_result = json.loads(json_match.group())
-
+                result = json.loads(json_match.group())
+                is_multihop = bool(result.get("is_multihop", False))
                 return {
-                    "type": router_result.get("question_type", keyword_type),
-                    "confidence": router_result.get("confidence", 0.8),
-                    "method": "llm_router",
-                    "reasoning": router_result.get("reasoning", "LLM语义分析")
+                    "type":       "complex" if is_multihop else "simple",
+                    "confidence": float(result.get("confidence", 0.8)),
+                    "method":     "llm_router",
+                    "reasoning":  result.get("reasoning", ""),
                 }
-
         except Exception as e:
-            print(f"  ⚠️ LLM Router 失败 ({e})，使用关键词分类结果")
+            print(f"  ⚠️ LLM Router 失败 ({e})，默认路由至 Advanced RAG")
 
-        # 4. LLM Router 失败时，回退到关键词分类
+        # 回退：默认多跳（Advanced RAG 容错能力更强）
         return {
-            "type": keyword_type,
-            "confidence": keyword_confidence,
-            "method": "keyword_fallback",
-            "reasoning": f"LLM Router 失败，回退到关键词分类"
+            "type":       "complex",
+            "confidence": 0.5,
+            "method":     "fallback",
+            "reasoning":  "LLM Router 失败，兜底使用 Advanced RAG",
         }
 
 
@@ -1133,7 +1066,6 @@ class AdaptiveRAG:
         self.stats = {
             "simple": 0,
             "complex": 0,
-            "reasoning": 0
         }
 
         print(f"✅ Adaptive RAG 系统初始化完成（session: {self.session_id}）\n")
@@ -1267,7 +1199,7 @@ class AdaptiveRAG:
 
     def reset_stats(self):
         """重置统计信息"""
-        self.stats = {"simple": 0, "complex": 0, "reasoning": 0}
+        self.stats = {"simple": 0, "complex": 0}
 
 
 # ============================================================
@@ -1327,8 +1259,7 @@ class AdaptiveRAGEvaluator:
         print("📊 策略使用统计")
         print("="*80)
         print(f"事实题 (Baseline): {stats['simple']} ({stats['simple']/total*100:.1f}%)")
-        print(f"复杂题 (Advanced): {stats['complex']} ({stats['complex']/total*100:.1f}%)")
-        print(f"推理题 (Advanced): {stats['reasoning']} ({stats['reasoning']/total*100:.1f}%)")
+        print(f"多跳题 (Advanced): {stats['complex']} ({stats['complex']/total*100:.1f}%)")
         print("="*80)
 
         return {
@@ -1453,8 +1384,7 @@ def run_ragas_evaluation(adaptive_rag: AdaptiveRAG,
     print("📊 策略使用统计")
     print("="*80)
     print(f"事实题 (Baseline): {stats['simple']} ({stats['simple']/total*100:.1f}%)")
-    print(f"复杂题 (Advanced): {stats['complex']} ({stats['complex']/total*100:.1f}%)")
-    print(f"推理题 (Advanced): {stats['reasoning']} ({stats['reasoning']/total*100:.1f}%)")
+    print(f"多跳题 (Advanced): {stats['complex']} ({stats['complex']/total*100:.1f}%)")
     print("="*80)
 
     return merged_df

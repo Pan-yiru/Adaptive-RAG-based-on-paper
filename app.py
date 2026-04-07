@@ -133,7 +133,7 @@ def render_sidebar(rag: AdaptiveRAG) -> None:
             total = sum(stats.values()) or 1
             st.write("**策略分布**")
             st.progress(stats["simple"] / total, text=f"Baseline: {stats['simple']}")
-            adv = stats["complex"] + stats["reasoning"]
+            adv = stats["complex"]
             st.progress(adv / total, text=f"Advanced: {adv}")
 
 
