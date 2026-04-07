@@ -4,22 +4,22 @@
 
 ## 核心思路
 
-对输入问题进行分类，再路由到对应的 RAG 管道：
+对输入问题进行分类，路由到对应的 RAG 管道：
 
-| 问题类型 | 特征关键词 | 使用策略 |
+| 问题类型 | 判断标准 | 使用策略 |
 |---|---|---|
-| 事实题 (simple) | 多少、是什么、哪些、参数… | **Baseline RAG** — 直接向量检索 |
-| 复杂题 (complex) | 为什么、如何、原理、对比… | **Advanced RAG** — 问题分解 + Rerank + 反思重写 |
-| 推理题 (reasoning) | 如果、假设、推测、导致… | **Advanced RAG** — 问题分解 + Rerank + 反思重写 |
+| 单跳问题 (simple) | 答案可从文档某一处直接找到 | **Baseline RAG** — 直接向量检索 |
+| 多跳问题 (complex) | 需要串联文档多处信息才能回答 | **Advanced RAG** — 问题分解 + Rerank + 反思重写 |
+
+分类由 **LLM Router** 完成：调用 `qwen-turbo` 判断问题是否为多跳，失败时兜底路由至 Advanced RAG。
 
 ## 系统架构
 
 ```
 AdaptiveRAG
 ├── DocumentProcessor         # PDF 加载 / 清洗 / 切分
-├── QuestionClassifier        # LLM Router + 关键词混合分类
-│   ├── _keyword_classify()   # 快速关键词匹配（高置信度时直接使用）
-│   └── LLM Router            # 置信度低时调用 qwen-turbo 做语义分类
+├── QuestionClassifier        # 纯 LLM Router：判断是否为多跳问题
+│   └── classify()            # is_multihop=true → complex，false → simple；失败兜底 Advanced
 ├── BaselineRAG               # Chroma 向量检索 → LCEL Chain
 ├── AdvancedRAG               # LangGraph 反思智能体
 │   ├── Contextualize         # 利用对话历史还原代词指代
@@ -119,7 +119,7 @@ answer, strategy, contexts = rag.answer(
 
 ```python
 stats = rag.get_stats()
-# {'simple': 2, 'complex': 3, 'reasoning': 1}
+# {'simple': 3, 'complex': 3}
 ```
 
 ## Docker 部署
@@ -163,7 +163,7 @@ report = run_ragas_evaluation(
 )
 ```
 
-采样比例与评测集题型分布一致（基础题 76%、复杂题 14%、推理题 10%）。
+采样按评测集题型分布（基础题 76%、多跳/推理题 24%）比例进行。
 
 ### 全量评测
 
