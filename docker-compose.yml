@@ -1,0 +1,70 @@
+# ============================================================
+# Adaptive RAG · Docker Compose 编排
+# 服务：app（Streamlit）/ redis / chromadb
+# 启动：docker compose up --build
+# ============================================================
+
+services:
+
+  # ── Redis：会话记忆 ──────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ChromaDB：向量库服务 ──────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── App：Streamlit 前端 ────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    # 从 .env 文件加载敏感变量（DASHSCOPE_API_KEY 等）
+    env_file:
+      - .env
+    # 运行时注入服务发现地址（覆盖 .env 中的本地默认值）
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    volumes:
+      # 挂载同一 chroma 卷，使嵌入模式与 HTTP 模式均可访问
+      - chroma_data:/app/chroma_db
+
+volumes:
+  redis_data:
+  chroma_data:

@@ -8,13 +8,21 @@ Adaptive RAG: 自适应检索增强生成系统
 import os
 import re
 import json
+import uuid
 import tempfile
-import shutil
-from typing import List, Tuple, Dict, Optional
+from datetime import datetime, timezone
+from typing import List, Tuple, Dict, Optional, TypedDict
+from langgraph.graph import StateGraph, END
 from dotenv import load_dotenv
 import dashscope
 import requests
 import numpy as np
+
+try:
+    import redis as redis_lib
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
 
 from openai import OpenAI
 from langchain_community.vectorstores import Chroma
@@ -26,7 +34,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.embeddings import Embeddings
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 
 # ============================================================
 # 1. 基础配置
@@ -63,6 +70,103 @@ class QwenEmbeddings(Embeddings):
             return []
         completion = self.client.embeddings.create(model=self.model, input=text)
         return completion.data[0].embedding
+
+
+# ============================================================
+# 1.5 会话记忆（Redis 短期记忆）
+# ============================================================
+
+class SessionMemory:
+    """
+    基于 Redis 的会话短期记忆
+    - 每个 session_id 存储最近 max_turns 轮对话
+    - Redis 不可用时自动降级为内存存储（当次进程内有效）
+    """
+
+    def __init__(self, host: str = "localhost", port: int = 6379,
+                 db: int = 0, max_turns: int = 10):
+        self.max_turns = max_turns
+        self._fallback: Dict[str, List] = {}  # Redis 不可用时的内存回退
+        if REDIS_AVAILABLE:
+            try:
+                self._redis = redis_lib.Redis(
+                    host=host, port=port, db=db,
+                    decode_responses=True,
+                    socket_connect_timeout=2
+                )
+                self._redis.ping()
+                self.available = True
+                print("✅ Redis 连接成功，会话记忆已启用")
+            except Exception:
+                self._redis = None
+                self.available = False
+                print("⚠️ Redis 不可用，降级为内存会话记忆")
+        else:
+            self._redis = None
+            self.available = False
+            print("⚠️ redis 未安装，降级为内存会话记忆")
+
+    def get_history(self, session_id: str) -> List[Dict]:
+        """获取最近 max_turns 轮对话记录"""
+        key = f"session:{session_id}"
+        try:
+            if self._redis:
+                raw = self._redis.lrange(key, -self.max_turns * 2, -1)
+                return [json.loads(m) for m in raw]
+        except Exception:
+            pass
+        raw_fallback = self._fallback.get(key, [])[-self.max_turns * 2:]
+        # _fallback 存储的是 JSON 字符串，需要解析后再返回
+        return [json.loads(m) if isinstance(m, str) else m for m in raw_fallback]
+
+    def add_turn(self, session_id: str, question: str, answer: str):
+        """追加一轮对话并裁剪超长记录"""
+        key = f"session:{session_id}"
+        messages = [
+            json.dumps({"role": "user",      "content": question}, ensure_ascii=False),
+            json.dumps({"role": "assistant", "content": answer},   ensure_ascii=False),
+        ]
+        try:
+            if self._redis:
+                pipe = self._redis.pipeline()
+                for msg in messages:
+                    pipe.rpush(key, msg)
+                pipe.ltrim(key, -self.max_turns * 2, -1)
+                pipe.execute()
+                return
+        except Exception:
+            pass
+        # 内存回退
+        existing = self._fallback.get(key, [])
+        existing.extend(messages)
+        self._fallback[key] = existing[-self.max_turns * 2:]
+
+    def clear(self, session_id: str):
+        """清空指定会话的历史"""
+        key = f"session:{session_id}"
+        try:
+            if self._redis:
+                self._redis.delete(key)
+                return
+        except Exception:
+            pass
+        self._fallback.pop(key, None)
+
+    def list_sessions(self) -> List[str]:
+        """返回所有 session_id 列表（从 Redis SCAN 或内存回退）"""
+        try:
+            if self._redis:
+                keys = []
+                cursor = 0
+                while True:
+                    cursor, batch = self._redis.scan(cursor, match="session:*", count=100)
+                    keys.extend(k[len("session:"):] for k in batch)
+                    if cursor == 0:
+                        break
+                return keys
+        except Exception:
+            pass
+        return [k[len("session:"):] for k in self._fallback]
 
 
 # ============================================================
@@ -129,16 +233,19 @@ class DocumentProcessor:
 # ============================================================
 # 3. 检索器创建
 
-def create_retriever(chunks: List, weights: List[float] = [0.4, 0.6]) -> EnsembleRetriever:
+def create_retriever(chunks: List, weights: List[float] = None, vectorstore=None) -> EnsembleRetriever:
     """创建混合检索器（BM25 + Dense）"""
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=QwenEmbeddings(
-            model="text-embedding-v4",
-            api_key=os.environ["DASHSCOPE_API_KEY"],
-            batch_size=10
+    if weights is None:
+        weights = [0.4, 0.6]
+    if vectorstore is None:
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=QwenEmbeddings(
+                model="text-embedding-v4",
+                api_key=os.environ["DASHSCOPE_API_KEY"],
+                batch_size=10
+            )
         )
-    )
 
     bm25_retriever = BM25Retriever.from_documents(chunks)
     bm25_retriever.k = 10
@@ -147,7 +254,7 @@ def create_retriever(chunks: List, weights: List[float] = [0.4, 0.6]) -> Ensembl
 
     retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, vector_retriever],
-        weights=[0.4, 0.6] # 给予向量检索稍高权重
+        weights=weights
     )
 
     print("✅ 混合检索器创建完成")
@@ -289,10 +396,6 @@ class QuestionClassifier:
             print(f"  🔄 关键词分类置信度较低 ({keyword_confidence:.2f})，使用 LLM Router...")
             router_output = self.router_chain.invoke({"question": question})
 
-            # 解析 JSON 输出
-            import json
-            import re
-
             # 尝试提取 JSON
             json_match = re.search(r'\{[^{}]*\}', router_output)
             if json_match:
@@ -316,11 +419,6 @@ class QuestionClassifier:
             "reasoning": f"LLM Router 失败，回退到关键词分类"
         }
 
-    def should_use_decomposition(self, question: str) -> bool:
-        """判断是否需要问题分解"""
-        result = self.classify(question)
-        return result["type"] in ["complex", "reasoning"]
-
 
 # ============================================================
 # 5. Baseline RAG 策略
@@ -328,27 +426,28 @@ class QuestionClassifier:
 class BaselineRAG:
     """Baseline RAG: 直接检索策略（完全对齐 rag_baseline.ipynb）"""
 
-    def __init__(self, chunks, llm=None):
+    def __init__(self, chunks=None, llm=None, vectorstore=None):
         """
         初始化 Baseline RAG（对齐 rag_baseline.ipynb 逻辑）
 
         参数:
-        - chunks: 切分后的文档块列表
+        - chunks: 切分后的文档块列表（vectorstore 已提供时可为 None）
         - llm: 可选的 LLM 实例
+        - vectorstore: 可选的预构建 Chroma 向量库（避免重复 Embedding）
         """
-        # 创建 Chroma 向量检索器
-        self.vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=QwenEmbeddings(
-                model="text-embedding-v4",
-                api_key=os.environ["DASHSCOPE_API_KEY"],
-                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-                batch_size=10
+        # 复用外部向量库或新建
+        if vectorstore is not None:
+            self.vectorstore = vectorstore
+        else:
+            self.vectorstore = Chroma.from_documents(
+                documents=chunks,
+                embedding=QwenEmbeddings(
+                    model="text-embedding-v4",
+                    api_key=os.environ["DASHSCOPE_API_KEY"],
+                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    batch_size=10
+                )
             )
-        )
-
-        # 创建检索器（只用向量检索，与 rag_baseline.ipynb 一致）
-        self.retriever = self.vectorstore.as_retriever()
 
         # LLM 配置（与 rag_baseline.ipynb 一致）
         self.llm = llm or ChatOpenAI(
@@ -373,40 +472,90 @@ class BaselineRAG:
         请用专业、简洁的中文回答："""
         )
 
-        # format_docs 函数
-        def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
-
-        # Chain: Retriever -> Format -> Prompt -> LLM -> Output Parser
-        self.chain = (
-            {"context": self.retriever | format_docs, "question": RunnablePassthrough()}
-            | self.prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
     def answer(self, question: str, top_k: int = 3) -> Tuple[str, List[str]]:
         """
         生成答案（完全对齐 rag_baseline.ipynb 逻辑）
 
         返回: (答案, 检索到的上下文列表)
         """
-        # 先检索获取上下文
-        docs = self.retriever.invoke(question)
+        # 按 top_k 创建检索器
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": top_k})
+
+        # 检索并过滤空文档
+        docs = retriever.invoke(question)
         docs = [doc for doc in docs if getattr(doc, "page_content", "").strip()]
         retrieved_contexts = [doc.page_content for doc in docs]
 
-        # 使用 LCEL chain 生成答案
-        answer = self.chain.invoke(question)
+        # 用检索到的文档构建 context 后生成答案
+        context = "\n\n".join(retrieved_contexts)
+        prompt_value = self.prompt.format(context=context, question=question)
+        response = self.llm.invoke(prompt_value)
+        answer_text = response.content if hasattr(response, "content") else str(response)
 
-        return answer, retrieved_contexts
+        return answer_text, retrieved_contexts
+
+    def stream_answer(self, question: str, top_k: int = 3):
+        """
+        Baseline 的流式接口（单步生成，yield 一个 node 事件 + done 事件）。
+        """
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": top_k})
+        docs = retriever.invoke(question)
+        docs = [doc for doc in docs if getattr(doc, "page_content", "").strip()]
+        retrieved_contexts = [doc.page_content for doc in docs]
+        sources = [
+            {
+                "index": i + 1,
+                "content": doc.page_content,
+                "page": doc.metadata.get("page", "-"),
+                "source": doc.metadata.get("source", "-"),
+            }
+            for i, doc in enumerate(docs)
+        ]
+        yield {"type": "node", "node": "retrieve",
+               "data": {"all_docs": docs}}
+
+        context = "\n\n".join(retrieved_contexts)
+        prompt_value = self.prompt.format(context=context, question=question)
+        response = self.llm.invoke(prompt_value)
+        answer_text = response.content if hasattr(response, "content") else str(response)
+
+        yield {"type": "node", "node": "generate",
+               "data": {"final_answer": answer_text}}
+        yield {"type": "done", "answer": answer_text,
+               "contexts": retrieved_contexts, "sources": sources}
 
 
 # ============================================================
 # 6. Advanced RAG 策略
 
+class AdvancedRAGState(TypedDict):
+    """LangGraph 图状态"""
+    question: str
+    contextualized_question: str  # 代词还原后的完整问题
+    history: List[Dict]           # 当前 session 的历史对话
+    sub_questions: List[str]
+    all_docs: List                # 检索合并后的全量文档
+    reranked_docs: List           # Rerank 后的 Top-K 文档
+    top_score: float              # Rerank 最高相关度分数
+    sub_answers: List[str]
+    final_answer: str
+    sources: List[Dict]           # 引用来源列表（供前端可视化）
+    retry_count: int              # 已触发改写次数
+    top_k: int                    # 最终保留文档数
+    expand_k: int                 # 检索扬展系数（每次改写后扩大单次检索数量）
+    hyde_query: str               # HyDE 假设性文档文本（retry==1 时生成，替换子问题做向量检索）
+
+
 class AdvancedRAG:
-    """Advanced RAG: 问题分解 + Rerank 策略（适用于复杂题和推理题）"""
+    """
+    Advanced RAG：基于 LangGraph 的反思智能体
+
+    流程：Plan → Retrieve → Rerank → Verify ─┬→ Generate
+                                    ↑         └→ Rewrite ─┘
+    - Verify  ：Rerank 最高分 < RERANK_THRESHOLD 且未超重试上限时触发 Rewrite
+    - Rewrite ：改写子问题，重新检索（最多 MAX_RETRIES 次）
+    - Consistency：所有子问题共享同一套 Top-K 文档，消除证据冲突
+    """
 
     def __init__(self, retriever, llm=None):
         self.retriever = retriever
@@ -471,26 +620,73 @@ class AdvancedRAG:
 - 答案简洁明了，1-2 句话
 - 如果资料不足，明确说"我不知道"
 - 保持逻辑连贯
+- 在答案中用 [1]、[2] 等标注引用的参考文档编号（如"...注意力机制 [1]"）
 
 最终回答："""
         )
 
-        self.decompose_chain = self.decompose_prompt | self.llm | StrOutputParser()
-        self.subqa_chain = self.subqa_prompt | self.llm | StrOutputParser()
-        self.final_chain = self.final_prompt | self.llm | StrOutputParser()
+        # 查询改写 prompt（检索质量不足时触发）
+        self.rewrite_prompt = ChatPromptTemplate.from_template(
+            """你是一个查询改写助手。当前检索结果相关度不足，请改写子问题以提升检索效果。
 
-    @staticmethod
-    def _deduplicate_docs(docs: List) -> List:
-        """按 page_content 去重并保持顺序"""
-        unique_docs = []
-        seen = set()
-        for doc in docs:
-            text = getattr(doc, "page_content", "").strip()
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            unique_docs.append(doc)
-        return unique_docs
+原始问题：{question}
+当前子问题：
+{sub_questions_str}
+
+改写要求：
+1. 使用更具体的学术术语或同义词
+2. 补充相关背景概念
+3. 保持子问题的独立可检索性
+4. 数量与原来保持一致
+
+请以JSON数组格式返回改写后的子问题：
+["改写后子问题1", "改写后子问题2", ...]"""
+        )
+
+        # HyDE prompt：生成假设性文档文本，切换向量空间改善 semantic match
+        self.hyde_prompt = ChatPromptTemplate.from_template(
+            """请根据以下问题，生成一段假设性的参考文档摘录（2-3 句话）。
+这段文字将用于在学术文档库中做向量相似度检索，要求：
+1. 使用与学术论文相近的表达方式和专业术语
+2. 包含问题所涉及的核心技术概念
+3. 风格像是从教材、论文或技术报告中直接摘录的句子
+（注意：这不是你对问题的真实回答，只是一段帮助检索到正确文档的假设性文本）
+
+问题：{question}
+
+假设性文档摘录（只输出文本本身，不要任何前缀或解释）："""
+        )
+
+        # 问题还原 prompt（利用历史对话消除代词指代）
+        self.contextualize_prompt = ChatPromptTemplate.from_template(
+            """根据以下对话历史，将用户的最新问题改写为一个独立、完整的问题（还原其中的代词和指代关系）。
+如果问题不含任何代词或指代，原样返回即可。只输出改写后的问题，不要解释。
+
+对话历史：
+{history}
+
+最新问题：{question}
+
+改写后的问题："""
+        )
+
+        self.decompose_chain     = self.decompose_prompt     | self.llm | StrOutputParser()
+        self.subqa_chain         = self.subqa_prompt         | self.llm | StrOutputParser()
+        self.final_chain         = self.final_prompt         | self.llm | StrOutputParser()
+        self.rewrite_chain       = self.rewrite_prompt       | self.llm | StrOutputParser()
+        self.hyde_chain          = self.hyde_prompt          | self.llm | StrOutputParser()
+        self.contextualize_chain = self.contextualize_prompt | self.llm | StrOutputParser()
+
+        # 构建 LangGraph 流程图
+        self.graph = self._build_graph()
+
+    RERANK_THRESHOLD   = 0.3   # 相关度低于此值时触发改写
+    NO_ANSWER_THRESHOLD = 0.1   # 相关度低于此值时语料库中确实无相关内容，直接拒绝回答
+    MAX_RETRIES        = 2     # 最大改写重试次数
+    EXPAND_MULTIPLIER  = 3     # 第一次改写后展宽单次检索 k 的倍数
+
+    # ----------------------------------------------------------
+    # 工具方法
 
     def _parse_sub_questions(self, raw_output: str) -> List[str]:
         """解析子问题"""
@@ -499,7 +695,7 @@ class AdvancedRAG:
             parsed = json.loads(raw_output)
             if isinstance(parsed, list):
                 candidates = [str(item) for item in parsed]
-        except:
+        except (json.JSONDecodeError, ValueError):
             pass
 
         if not candidates:
@@ -515,10 +711,10 @@ class AdvancedRAG:
 
         return cleaned[:6]
 
-    def _rerank_documents(self, query: str, docs: List, top_n: int = 3) -> List:
-        """使用 GTE-Rerank 对文档重排"""
+    def _rerank_with_scores(self, query: str, docs: List, top_n: int = 3) -> Tuple[List, float]:
+        """使用 GTE-Rerank 重排文档，返回 (reranked_docs, top_relevance_score)"""
         if not docs:
-            return docs
+            return [], 0.0
 
         doc_texts = [d.page_content for d in docs]
         try:
@@ -526,78 +722,305 @@ class AdvancedRAG:
                 model="gte-rerank-v2",
                 query=query,
                 documents=doc_texts,
-                top_n=top_n
+                top_n=top_n,
+                return_documents=False
             )
             if response.status_code == 200:
-                return [docs[item.index] for item in response.output.results]
+                results = response.output.results
+                reranked = [docs[item.index] for item in results]
+                top_score = results[0].relevance_score if results else 0.0
+                return reranked, top_score
         except Exception as e:
             print(f"⚠️ Rerank 失败: {e}")
 
-        return docs[:top_n]
+        return docs[:top_n], 0.0
 
-    def answer(self, question: str, top_k: int = 3) -> Tuple[str, List[str]]:
-        """
-        生成答案
+    # ----------------------------------------------------------
+    # LangGraph 节点
 
-        返回: (答案, 检索到的上下文列表)
-        """
-        # 1. 问题分解
+    def _contextualize_node(self, state: AdvancedRAGState) -> dict:
+        """Contextualize：利用会话历史还原代词，将问题改写为独立完整的表述"""
+        history = state.get("history") or []
+        question = state["question"]
+        if not history:
+            return {"contextualized_question": question}
+        history_str = "\n".join(
+            f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
+            for m in history[-6:]
+        )
         try:
-            raw_sub_questions = self.decompose_chain.invoke({"question": question})
-            sub_questions = self._parse_sub_questions(raw_sub_questions)
+            result = self.contextualize_chain.invoke({
+                "history": history_str,
+                "question": question,
+            })
+            contextualized = result.strip() or question
+        except Exception as e:
+            print(f"⚠️ 问题还原失败: {e}")
+            contextualized = question
+        if contextualized != question:
+            print(f"  💬 问题还原: '{question[:40]}' → '{contextualized[:40]}'")
+        return {"contextualized_question": contextualized}
+
+    def _plan_node(self, state: AdvancedRAGState) -> dict:
+        """Plan：将还原后的完整问题分解为互补子问题"""
+        effective_q = state.get("contextualized_question") or state["question"]
+        try:
+            raw = self.decompose_chain.invoke({"question": effective_q})
+            sub_questions = self._parse_sub_questions(raw)
         except Exception as e:
             print(f"⚠️ 子问题生成失败，使用原问题: {e}")
-            sub_questions = [question]
-
+            sub_questions = [effective_q]
         if not sub_questions:
-            sub_questions = [question]
+            sub_questions = [effective_q]
+        print(f"  📋 分解为 {len(sub_questions)} 个子问题")
+        return {"sub_questions": sub_questions}
 
-        # 2. 对每个子问题检索并收集所有文档
-        all_retrieved_docs = []
-        seen_docs = set()
-
-        for sub_question in sub_questions:
-            # 检索
-            retrieved_docs = self.retriever.invoke(sub_question)
-            retrieved_docs = [doc for doc in retrieved_docs if getattr(doc, "page_content", "").strip()]
-
-            # 收集所有去重文档
-            for doc in retrieved_docs:
+    def _retrieve_node(self, state: AdvancedRAGState) -> dict:
+        """Retrieve：对所有子问题检索，合并去重；HyDE 模式下以假设性文本替代子问题向量"""
+        all_docs = []
+        seen = set()
+        k_per_query = state.get("expand_k", 10)
+        # HyDE 模式：用假设性文档文本做向量检索，切换到文档向量空间
+        hyde_query = state.get("hyde_query", "")
+        queries = [hyde_query] if hyde_query else state["sub_questions"]
+        mode = "HyDE" if hyde_query else "子问题"
+        for query in queries:
+            docs = self.retriever.invoke(query, config={"configurable": {"k": k_per_query}})
+            # EnsembleRetriever 不保证 config 传递 k，直接截取
+            docs = [d for d in docs if getattr(d, "page_content", "").strip()]
+            for doc in docs:
                 text = doc.page_content.strip()
-                if text and text not in seen_docs:
-                    seen_docs.add(text)
-                    all_retrieved_docs.append(doc)
+                if text and text not in seen:
+                    seen.add(text)
+                    all_docs.append(doc)
+        print(f"  🔎 检索完成（{mode}），共 {len(all_docs)} 个去重文档（k={k_per_query}）")
+        return {"all_docs": all_docs}
 
-        # 3. Rerank - 对所有检索到的文档进行重排，只保留top_k个最相关的
-        reranked_docs = self._rerank_documents(question, all_retrieved_docs, top_n=top_k)
-
-        # 4. 基于reranked后的文档生成子问题答案
-        sub_answers = []
-        doc_contexts = [doc.page_content for doc in reranked_docs]
-        context_text = "\n\n".join(doc_contexts)
-
-        for sub_question in sub_questions:
-            if context_text:
-                answer = self.subqa_chain.invoke({"context": context_text, "question": sub_question})
-            else:
-                answer = "资料中未找到相关内容"
-            sub_answers.append(answer)
-
-        # 5. 生成最终答案 - 子问题答案 + reranked文档
-        subqa_context = "\n\n".join(
-            [f"子问题 {i+1}: {sub_q}\n回答: {sub_a}" for i, (sub_q, sub_a) in enumerate(zip(sub_questions, sub_answers))]
+    def _rerank_node(self, state: AdvancedRAGState) -> dict:
+        """Rerank：针对还原后的完整问题全局重排，确保所有子问题共享同一套证据"""
+        effective_q = state.get("contextualized_question") or state["question"]
+        reranked_docs, top_score = self._rerank_with_scores(
+            effective_q, state["all_docs"], top_n=state["top_k"]
         )
-        doc_context = "\n\n".join([f"文档 {i+1}: {doc.page_content}" for i, doc in enumerate(reranked_docs)])
+        print(f"  🏆 Rerank 完成，最高相关度: {top_score:.3f}")
+        return {"reranked_docs": reranked_docs, "top_score": top_score}
+
+    def _rewrite_node(self, state: AdvancedRAGState) -> dict:
+        """
+        改写策略（两阶段兜底）：
+        - 第 1 次：改写子问题 + 展宽单次检索 k（捕获更多候选文档）
+        - 第 2 次：放弃子问题分解，直接用还原后的完整问题单路检索（Baseline 充层）
+        """
+        effective_q = state.get("contextualized_question") or state["question"]
+        retry = state["retry_count"]
+
+        if retry == 0:
+            # 第一次：改写子问题，同时扩大检索数量
+            sub_questions_str = "\n".join(f"{i+1}. {q}" for i, q in enumerate(state["sub_questions"]))
+            try:
+                raw = self.rewrite_chain.invoke({
+                    "question": effective_q,
+                    "sub_questions_str": sub_questions_str,
+                })
+                rewritten = self._parse_sub_questions(raw)
+                if not rewritten:
+                    rewritten = state["sub_questions"]
+            except Exception as e:
+                print(f"⚠️ 查询改写失败: {e}")
+                rewritten = state["sub_questions"]
+            new_expand_k = state.get("expand_k", 10) * self.EXPAND_MULTIPLIER
+            print(f"  ✏️ 第 1 次改写：{len(rewritten)} 个子问题，检索扩展至 k={new_expand_k}")
+            return {"sub_questions": rewritten, "retry_count": 1, "expand_k": new_expand_k}
+        else:
+            # 第二次：HyDE - 生成假设性文档文本，切换向量空间改善 semantic match
+            try:
+                hyde_text = self.hyde_chain.invoke({"question": effective_q}).strip()
+                if not hyde_text:
+                    hyde_text = effective_q
+            except Exception as e:
+                print(f"⚠️ HyDE 生成失败: {e}")
+                hyde_text = effective_q
+            new_expand_k = state.get("expand_k", 30) * self.EXPAND_MULTIPLIER
+            print(f"  🔬 第 2 次：HyDE 向量切换，假设性文档长度={len(hyde_text)}，k={new_expand_k}")
+            return {
+                "sub_questions": [effective_q],   # 生成时仍以原始问题为准
+                "hyde_query":    hyde_text,        # 检索时切换为假设性文档向量
+                "retry_count":   2,
+                "expand_k":      new_expand_k,
+            }
+
+    def _generate_node(self, state: AdvancedRAGState) -> dict:
+        """Generate：所有子问题共享同一套 Top-K 文档，消除证据冲突"""
+        reranked_docs = state["reranked_docs"]
+        sub_questions = state["sub_questions"]
+        # 使用还原后的完整问题作为最终回答依据
+        question = state.get("contextualized_question") or state["question"]
+
+        # 硬拒绝：相关度极低，语料库中根本不含相关内容，不调用 LLM 防止幻觉
+        if state.get("top_score", 1.0) < self.NO_ANSWER_THRESHOLD:
+            no_answer = (
+                f"抱歉，当前文档库中未找到与该问题相关的内容（最高相关度 {state['top_score']:.2f}），"
+                "无法作答。请尝试换一个问题，或确认该问题是否在文档覆盖范围内。"
+            )
+            print(f"  🚫 相关度极低 ({state['top_score']:.3f} < {self.NO_ANSWER_THRESHOLD})，拒绝生成")
+            return {"sub_answers": [], "final_answer": no_answer, "sources": []}
+
+        context_text = "\n\n".join(doc.page_content for doc in reranked_docs)
+
+        sub_answers = []
+        for sub_q in sub_questions:
+            ans = (
+                self.subqa_chain.invoke({"context": context_text, "question": sub_q})
+                if context_text else "资料中未找到相关内容"
+            )
+            sub_answers.append(ans)
+
+        subqa_context = "\n\n".join(
+            f"子问题 {i+1}: {sub_q}\n回答: {sub_a}"
+            for i, (sub_q, sub_a) in enumerate(zip(sub_questions, sub_answers))
+        )
+        doc_context = "\n\n".join(
+            f"文档 {i+1}: {doc.page_content}" for i, doc in enumerate(reranked_docs)
+        )
         final_answer = self.final_chain.invoke({
             "subqa_context": subqa_context,
             "doc_context": doc_context,
             "question": question,
         })
 
-        # 6. 返回最终答案和reranked后的文档上下文（保持top_k数量）
-        retrieved_contexts = [doc.page_content for doc in reranked_docs]
+        # 低置信度标注：所有重试后 top_score 仍未过阈值，明确告知用户证据不足
+        if state.get("top_score", 1.0) < self.RERANK_THRESHOLD:
+            final_answer = (
+                f"⚠️ 文档中未找到强相关证据（相关度 {state['top_score']:.2f} < {self.RERANK_THRESHOLD}），"
+                f"以下回答基于有限信息，仅供参考：\n\n{final_answer}"
+            )
 
-        return final_answer, retrieved_contexts
+        # 构建引用来源列表（供前端可视化）
+        sources = [
+            {
+                "index": i + 1,
+                "content": doc.page_content,
+                "page": doc.metadata.get("page", "-"),
+                "source": doc.metadata.get("source", "-"),
+            }
+            for i, doc in enumerate(reranked_docs)
+        ]
+        return {"sub_answers": sub_answers, "final_answer": final_answer, "sources": sources}
+
+    # ----------------------------------------------------------
+    # 条件路由
+
+    def _verify_route(self, state: AdvancedRAGState) -> str:
+        """
+        验证路由：两阶段兜底策略
+        - 第 0 次失败 → Rewrite（改写子问题 + 扩展k）
+        - 第 1 次失败 → Rewrite（单路直接检索原始问题）
+        - 第 2 次失败 → 不再改写，直接生成（防止无限循环）
+        """
+        score   = state["top_score"]
+        retries = state["retry_count"]
+        if score < self.RERANK_THRESHOLD and retries < self.MAX_RETRIES:
+            strategy_hint = "改写+扩展k" if retries == 0 else "单路直接检索"
+            print(f"  ⚠️ 相关度不足 ({score:.3f} < {self.RERANK_THRESHOLD})，第 {retries+1} 次兜底：{strategy_hint}")
+            return "rewrite"
+        if score >= self.RERANK_THRESHOLD and retries >= 1:
+            print(f"  ✅ 兜底后相关度提升至: {score:.3f}，进入生成")
+        return "generate"
+
+    # ----------------------------------------------------------
+    # 图构建
+
+    def _build_graph(self):
+        """构建 LangGraph 流程图"""
+        workflow = StateGraph(AdvancedRAGState)
+        workflow.add_node("contextualize", self._contextualize_node)
+        workflow.add_node("plan",          self._plan_node)
+        workflow.add_node("retrieve",      self._retrieve_node)
+        workflow.add_node("rerank",        self._rerank_node)
+        workflow.add_node("rewrite",       self._rewrite_node)
+        workflow.add_node("generate",      self._generate_node)
+
+        workflow.set_entry_point("contextualize")
+        workflow.add_edge("contextualize", "plan")
+        workflow.add_edge("plan",          "retrieve")
+        workflow.add_edge("retrieve",      "rerank")
+        workflow.add_conditional_edges(
+            "rerank",
+            self._verify_route,
+            {"rewrite": "rewrite", "generate": "generate"}
+        )
+        workflow.add_edge("rewrite",  "retrieve")
+        workflow.add_edge("generate", END)
+
+        return workflow.compile()
+
+    def answer(self, question: str, top_k: int = 3,
+               history: List[Dict] = None) -> Tuple[str, List[str]]:
+        """
+        生成答案（LangGraph Contextualize→Plan→Retrieve→Rerank→Verify→Generate 流程）
+
+        参数:
+        - history: 当前 session 的历史对话（由 AdaptiveRAG 从 Redis 注入）
+
+        返回: (答案, 检索上下文列表)
+        """
+        initial_state: AdvancedRAGState = {
+            "question":               question,
+            "contextualized_question": "",
+            "history":                history or [],
+            "sub_questions":          [],
+            "all_docs":               [],
+            "reranked_docs":          [],
+            "top_score":              0.0,
+            "sub_answers":            [],
+            "final_answer":           "",
+            "sources":                [],
+            "retry_count":            0,
+            "top_k":                  top_k,
+            "expand_k":               10,  # 每个子问题默认检索 10 篇
+            "hyde_query":             "",  # HyDE 假设性文档文本（默认为空）
+        }
+        result = self.graph.invoke(initial_state)
+        return result["final_answer"], [doc.page_content for doc in result["reranked_docs"]]
+
+    def stream_answer(self, question: str, top_k: int = 3,
+                      history: List[Dict] = None):
+        """
+        流式生成答案，逐节点 yield 中间状态事件。
+
+        事件格式:
+        - {"type": "node", "node": <str>, "data": <dict>}  每个节点完成后
+        - {"type": "done", "answer": <str>, "contexts": <list>, "sources": <list>}
+        """
+        initial_state: AdvancedRAGState = {
+            "question":               question,
+            "contextualized_question": "",
+            "history":                history or [],
+            "sub_questions":          [],
+            "all_docs":               [],
+            "reranked_docs":          [],
+            "top_score":              0.0,
+            "sub_answers":            [],
+            "final_answer":           "",
+            "sources":                [],
+            "retry_count":            0,
+            "top_k":                  top_k,
+            "expand_k":               10,  # 每个子问题默认检索 10 篇
+            "hyde_query":             "",  # HyDE 假设性文档文本（默认为空）
+        }
+        accumulated: Dict = dict(initial_state)
+        for event in self.graph.stream(initial_state, stream_mode="updates"):
+            node_name = list(event.keys())[0]
+            node_data = event[node_name]
+            accumulated.update(node_data)
+            yield {"type": "node", "node": node_name, "data": node_data}
+
+        yield {
+            "type":     "done",
+            "answer":   accumulated.get("final_answer", ""),
+            "contexts": [doc.page_content for doc in accumulated.get("reranked_docs", [])],
+            "sources":  accumulated.get("sources", []),
+        }
 
 
 # ============================================================
@@ -606,7 +1029,10 @@ class AdvancedRAG:
 class AdaptiveRAG:
     """自适应 RAG 系统：根据问题类型自动选择最优策略"""
 
-    def __init__(self, pdf_url: str, chunk_size: int = 600, chunk_overlap: int = 60):
+    def __init__(self, pdf_url: str, chunk_size: int = 600, chunk_overlap: int = 60,
+                 persist_dir: str = None, session_id: str = None,
+                 redis_host: str = None, redis_port: int = None,
+                 chroma_host: str = None, chroma_port: int = None):
         """
         初始化 Adaptive RAG 系统
 
@@ -614,38 +1040,106 @@ class AdaptiveRAG:
         - pdf_url: PDF 文档 URL
         - chunk_size: 文档切分大小
         - chunk_overlap: 文档切分重叠大小
+        - persist_dir: ChromaDB 嵌入模式持久化目录（None 表示内存模式）
+        - session_id: 当前会话 ID（None 时自动生成 UUID）
+        - redis_host / redis_port: Redis 连接参数（优先读取 REDIS_HOST/REDIS_PORT 环境变量）
+        - chroma_host / chroma_port: ChromaDB HTTP 服务器地址（优先读取 CHROMA_HOST/CHROMA_PORT 环境变量）
         """
+        # 环境变量覆盖默认值
+        redis_host  = redis_host  or os.getenv("REDIS_HOST",  "localhost")
+        redis_port  = redis_port  or int(os.getenv("REDIS_PORT",  "6379"))
+        chroma_host = chroma_host or os.getenv("CHROMA_HOST", "") or None
+        chroma_port = chroma_port or int(os.getenv("CHROMA_PORT", "8000"))
+
         print("="*80)
         print("🚀 初始化 Adaptive RAG 系统")
         print("="*80)
+
+        # 会话 ID
+        self.session_id = session_id or str(uuid.uuid4())
 
         # 1. 加载和处理文档
         docs = DocumentProcessor.load_pdf(pdf_url)
         docs = DocumentProcessor.clean_docs(docs)
         chunks = DocumentProcessor.split_docs(docs, chunk_size, chunk_overlap)
 
-        # 2. 创建检索器（用于 AdvancedRAG）
-        self.retriever = create_retriever(chunks)
+        # 2. 向 chunks 注入 timestamp 和 session_id 元数据（为个性化知识打底）
+        ingest_time = datetime.now(timezone.utc).isoformat()
+        for chunk in chunks:
+            chunk.metadata.update({
+                "timestamp":  ingest_time,
+                "session_id": self.session_id,
+            })
 
-        # 3. 初始化两种策略
-        # BaselineRAG 使用自己的 Chroma 向量检索（对齐 rag_baseline.ipynb）
-        self.baseline = BaselineRAG(chunks)
-        # AdvancedRAG 使用 EnsembleRetriever（BM25 + Dense）
+        # 3. 创建共享 Embedding 实例
+        embeddings = QwenEmbeddings(
+            model="text-embedding-v4",
+            api_key=os.environ["DASHSCOPE_API_KEY"],
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            batch_size=10
+        )
+
+        # 4. 创建共享向量库
+        if chroma_host:
+            # HTTP 模式：连接独立的 ChromaDB 容器
+            import chromadb
+            _client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
+            # 如果集合已存在则复用，否则创建并写入文档
+            existing = [c.name for c in _client.list_collections()]
+            if "rag_docs" in existing:
+                print(f"🌐 连接已有 ChromaDB 集合 (http://{chroma_host}:{chroma_port})")
+                shared_vectorstore = Chroma(
+                    client=_client,
+                    collection_name="rag_docs",
+                    embedding_function=embeddings,
+                )
+            else:
+                print(f"🌐 在 ChromaDB 服务器上新建集合 (http://{chroma_host}:{chroma_port})")
+                shared_vectorstore = Chroma.from_documents(
+                    documents=chunks,
+                    embedding=embeddings,
+                    client=_client,
+                    collection_name="rag_docs",
+                )
+        elif persist_dir and os.path.isdir(persist_dir) and os.listdir(persist_dir):
+            # 嵌入模式：加载已有持久化目录
+            print(f"📂 加载已有向量库: {persist_dir}")
+            shared_vectorstore = Chroma(
+                persist_directory=persist_dir,
+                embedding_function=embeddings
+            )
+        else:
+            chroma_kwargs = {"documents": chunks, "embedding": embeddings}
+            if persist_dir:
+                os.makedirs(persist_dir, exist_ok=True)
+                chroma_kwargs["persist_directory"] = persist_dir
+                print(f"💾 新建持久化向量库: {persist_dir}")
+            shared_vectorstore = Chroma.from_documents(**chroma_kwargs)
+
+        # 5. 创建混合检索器（AdvancedRAG 使用，复用共享向量库）
+        self.retriever = create_retriever(chunks, vectorstore=shared_vectorstore)
+
+        # 6. 初始化两种策略（均复用共享向量库，无需重复 Embedding）
+        self.baseline = BaselineRAG(chunks, vectorstore=shared_vectorstore)
         self.advanced = AdvancedRAG(self.retriever)
 
-        # 4. 初始化问题分类器（LLM Router + 关键词混合策略）
+        # 7. 初始化问题分类器（LLM Router + 关键词混合策略）
         self.classifier = QuestionClassifier()
 
-        # 5. 统计信息
+        # 8. 会话记忆（Redis 短期记忆，Redis 不可用时自动降级为内存）
+        self.memory = SessionMemory(host=redis_host, port=redis_port)
+
+        # 9. 统计信息
         self.stats = {
             "simple": 0,
             "complex": 0,
             "reasoning": 0
         }
 
-        print("✅ Adaptive RAG 系统初始化完成\n")
+        print(f"✅ Adaptive RAG 系统初始化完成（session: {self.session_id}）\n")
 
-    def answer(self, question: str, top_k: int = 3, force_strategy: str = None) -> Tuple[str, str, List[str]]:
+    def answer(self, question: str, top_k: int = 3, force_strategy: str = None,
+               session_id: str = None) -> Tuple[str, str, List[str]]:
         """
         自适应回答问题
 
@@ -653,13 +1147,19 @@ class AdaptiveRAG:
         - question: 用户问题
         - top_k: 检索返回的文档数量
         - force_strategy: 强制使用指定策略 ("baseline" 或 "advanced")
+        - session_id: 会话 ID（覆盖实例默认值）
 
         返回: (答案, 策略类型, 检索上下文)
         """
+        sid = session_id or self.session_id
+
+        # 从 Redis（或内存回退）加载当前 session 的历史对话
+        history = self.memory.get_history(sid)
+
         # 判断问题类型（使用 LLM Router + 关键词混合策略）
         if force_strategy:
             strategy = force_strategy
-            qtype = "advanced" if force_strategy == "advanced" else "simple"
+            qtype = "complex" if force_strategy == "advanced" else "simple"
             classification_method = "force"
         else:
             classification_result = self.classifier.classify(question)
@@ -673,12 +1173,93 @@ class AdaptiveRAG:
         # 选择策略
         if strategy == "baseline":
             print(f"📝 [Baseline] 事实题 ({classification_method}): {question[:50]}...")
-            answer, contexts = self.baseline.answer(question, top_k)
+            # 历史仅用于代词还原：若首轮或无历史则直接检索，否则用 contextualize 还原后再走 Baseline
+            if history:
+                ctx_q = self.advanced.contextualize_chain.invoke({
+                    "history": "\n".join(
+                        f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
+                        for m in history[-6:]
+                    ),
+                    "question": question,
+                })
+                ctx_q = ctx_q.strip() or question
+            else:
+                ctx_q = question
+            answer, contexts = self.baseline.answer(ctx_q, top_k)
         else:
             print(f"🔍 [Advanced] {qtype}题 ({classification_method}): {question[:50]}...")
-            answer, contexts = self.advanced.answer(question, top_k)
+            # 将历史注入 AdvancedRAG，由 Contextualize 节点完成代词还原
+            answer, contexts = self.advanced.answer(question, top_k, history=history)
+
+        # 将本轮对话写入 Redis（或内存回退）
+        self.memory.add_turn(sid, question, answer)
 
         return answer, strategy, contexts
+
+    def stream_answer(self, question: str, top_k: int = 3,
+                      force_strategy: str = None,
+                      session_id: str = None):
+        """
+        流式问答接口，供 Streamlit UI 使用。
+
+        逐步 yield 事件：
+        - {"type": "strategy", "strategy": ..., "qtype": ..., "method": ...}
+        - {"type": "node", "node": ..., "data": ...}  （来自 LangGraph 节点）
+        - {"type": "done",  "answer": ..., "contexts": ..., "sources": ..., "strategy": ...}
+        """
+        sid = session_id or self.session_id
+        history = self.memory.get_history(sid)
+
+        # 路由决策
+        if force_strategy:
+            strategy = force_strategy
+            qtype = "complex" if force_strategy == "advanced" else "simple"
+            classification_method = "force"
+        else:
+            classification_result = self.classifier.classify(question)
+            qtype = classification_result["type"]
+            strategy = "baseline" if qtype == "simple" else "advanced"
+            classification_method = classification_result["method"]
+
+        self.stats[qtype] += 1
+        yield {"type": "strategy", "strategy": strategy,
+               "qtype": qtype, "method": classification_method}
+
+        if strategy == "baseline":
+            # 同步代词还原（与 answer() 保持一致）
+            if history:
+                ctx_q = self.advanced.contextualize_chain.invoke({
+                    "history": "\n".join(
+                        f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
+                        for m in history[-6:]
+                    ),
+                    "question": question,
+                })
+                ctx_q = ctx_q.strip() or question
+            else:
+                ctx_q = question
+            gen = self.baseline.stream_answer(ctx_q, top_k)
+        else:
+            gen = self.advanced.stream_answer(question, top_k, history=history)
+
+        answer = ""
+        contexts = []
+        sources = []
+        # 透传 node 事件；拦截 done 事件（避免发送两次 done），统一在循环后发送
+        for event in gen:
+            if event["type"] == "done":
+                answer   = event["answer"]
+                contexts = event["contexts"]
+                sources  = event["sources"]
+            else:
+                yield event
+
+        # 写回记忆
+        self.memory.add_turn(sid, question, answer)
+
+        # 发送唯一的 done 事件（含 strategy 字段，供 UI 展示）
+        yield {"type": "done", "answer": answer, "contexts": contexts,
+               "sources": sources, "strategy": strategy}
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
@@ -898,16 +1479,17 @@ def sample_stratified_evaluation(total_samples: int = 5) -> List:
     complex_count = max(1, int(total_samples * 0.14))
     reasoning_count = max(1, int(total_samples * 0.10))
 
-    # 调整总和
+    # 调整总和（逐步减1，避免任意 count 变为负数）
     total_allocated = basic_count + complex_count + reasoning_count
-    if total_allocated > total_samples:
-        if reasoning_count > 0:
-            reasoning_count -= (total_allocated - total_samples)
-        elif complex_count > 0:
-            complex_count -= (total_allocated - total_samples)
+    while total_allocated > total_samples:
+        if reasoning_count > 1:
+            reasoning_count -= 1
+        elif complex_count > 1:
+            complex_count -= 1
         else:
-            basic_count -= (total_allocated - total_samples)
-    elif total_allocated < total_samples:
+            basic_count -= 1
+        total_allocated -= 1
+    if total_allocated < total_samples:
         basic_count += (total_samples - total_allocated)
 
     # 随机采样
@@ -925,7 +1507,6 @@ def sample_stratified_evaluation(total_samples: int = 5) -> List:
     print(f"   - 采样题号: {sorted(sampled_indices)}\n")
 
     return sorted(sampled_indices)
-
 
 # ============================================================
 # 11. 主程序入口
